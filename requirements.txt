@@ -1,0 +1,9 @@
+streamlit
+PyPDF2
+langchain
+langchain-nvidia-ai-endpoints
+langchain-huggingface
+faiss-cpu
+numpy
+python-dotenv
+sentence-transformers
