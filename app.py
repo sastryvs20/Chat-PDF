@@ -1,103 +1,145 @@
-from langchain_nvidia_ai_endpoints import ChatNVIDIA
 import streamlit as st
-from PyPDF2 import PdfReader
-from langchain.text_splitter import CharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-import faiss
-from dotenv import load_dotenv
 import os
-import numpy as np
+import tempfile
+from dotenv import load_dotenv
+from PyPDF2 import PdfReader
+from langchain_text_splitters import CharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_nvidia_ai_endpoints import ChatNVIDIA
+from pinecone import Pinecone
+from langchain_groq import ChatGroq
 
-# Load environment variables
 load_dotenv()
 
-def text_from_pdf(pdf_docs):
+# Initialize Pinecone client
+pc = Pinecone(
+    api_key=os.getenv("PINECONE_API_KEY")
+)
+
+# Ensure index exists
+index_name = 'firstindex'
+if index_name not in pc.list_indexes().names():
+    pc.create_index(
+        name=index_name,
+        dimension=768,
+        metric='cosine'
+    )
+
+# Connect to the Pinecone index
+index = pc.Index(index_name)
+
+# Extract text from pdf files
+def text_from_pdf(pdf_files):
+    """Extract text from PDF files."""
     text = ""
-    for pdf in pdf_docs:
-        pdf_reader = PdfReader(pdf)
-        for page in pdf_reader.pages:
-            text += page.extract_text()
+    for pdf in pdf_files:
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            temp_file.write(pdf.read())
+            temp_file_path = temp_file.name
+
+        try:
+            pdf_reader = PdfReader(temp_file_path)
+            for page in pdf_reader.pages:
+                text += page.extract_text()
+        finally:
+            os.unlink(temp_file_path)
     return text
 
+# Convert text to chunks
 def chunks_from_text(raw_text):
+    """Split raw text into smaller chunks."""
     text_splitter = CharacterTextSplitter(
-        separator="\n", 
+        separator="\n",
         chunk_size=1000,
         chunk_overlap=200,
         length_function=len
     )
-    chunks = text_splitter.split_text(raw_text)
-    return chunks
+    return text_splitter.split_text(raw_text)
 
-def get_vector_store(text_chunks):
+# Convert chunks to embeddings
+def initialize_pinecone_index(text_chunks):
+    """Store text chunks as embeddings in Pinecone."""
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2")
-    index = faiss.IndexFlatL2(len(embeddings.embed_query("hello world")))
 
-    # Add embeddings to the FAISS index
-    for chunk in text_chunks:
-        embedding = embeddings.embed_query(chunk)
-        embedding = np.array(embedding).reshape(1, -1)  # Convert to NumPy array and reshape to 2D
-        index.add(embedding)  # Add the reshaped embedding to the index
+    # Process chunks in smaller batches to avoid memory issues
+    batch_size = 100
+    for i in range(0, len(text_chunks), batch_size):
+        batch = text_chunks[i:i + batch_size]
+        vectors = [(str(i + j), embeddings.embed_query(chunk), {"text": chunk}) 
+                  for j, chunk in enumerate(batch)]
+        index.upsert(vectors)
 
-    return index, embeddings
+def get_response_from_query(query, k=3):
+    """Retrieve response from LLM using Pinecone search results."""
+    try:
+        # Get embeddings for the query
+        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2")
+        query_embedding = embeddings.embed_query(query)
 
-def search_vector_store(query, vector_store, embeddings, k=3):
-    # Convert query to embedding and search the vector store
-    query_embedding = embeddings.embed_query(query)
-    query_embedding = np.array(query_embedding).reshape(1, -1)
-    distances, indices = vector_store.search(query_embedding, k)  # Search for the top k nearest neighbors
-    return indices
+        # Search Pinecone
+        search_results = index.query(
+            vector=query_embedding,
+            top_k=k,
+            include_metadata=True
+        )
 
-def llama_response(prompt):
-    client = ChatNVIDIA(
-        model="meta/llama-3.1-405b-instruct",
-        api_key=os.getenv("NVIDIA_API_KEY"), 
-        temperature=0.2,
-        top_p=0.7,
-        max_tokens=1024,
-    )
-    response = ""
-    for chunk in client.stream([{"role":"user","content":prompt}]): 
-        response += chunk.content
-    return response
+        if not search_results["matches"]:
+            return "I cannot find the answer in the provided documents."
 
-def main():
-    st.set_page_config(
-        page_title='Chat with PDF',
-        page_icon=":books:"
-    )
-    st.header("Chat with multiple PDFs")
-    user_query = st.text_input("Ask a question")
+        # Combine search results
+        context = "\n".join([match["metadata"]["text"] for match in search_results["matches"]])
 
-    with st.sidebar:
-        st.subheader("Your Documents")
-        pdf_docs = st.file_uploader("Upload files here", accept_multiple_files=True)  # Accept multiple files
+        # Generate LLM response using ChatNVIDIA
+        llm = ChatNVIDIA(
+            model="meta/llama-3.1-405b-instruct",  # Updated to a valid model name
+            api_key=os.getenv("NVIDIA_API_KEY"),
+            temperature=0.2,
+            top_p=0.7,
+            max_tokens=1024
+        )
 
-        if pdf_docs:  # Trigger processing immediately upon upload
-            with st.spinner("Processing"):
-                # Convert PDFs to text
-                raw_text = text_from_pdf(pdf_docs)
+        # groq_api_key = os.getenv("GROQ_API_KEY")
 
-                # Split text into chunks
-                text_chunks = chunks_from_text(raw_text)
+        # llm = llm=ChatGroq(groq_api_key=groq_api_key,
+        #  model_name="mixtral-8x7b-32768")
 
-                # Store embeddings in the vector store
-                vector_store, embeddings = get_vector_store(text_chunks)
+        # Format the message for the chat model
+        messages = [
+            {
+                "role": "user",
+                "content": f"""Based on the following context, please answer the question. If the answer cannot be found in the context, say \"I cannot find the answer in the provided documents.\"\n\nContext: {context}\n\nQuestion: {query}"""
+            }
+        ]
 
-                st.success("Embeddings have been stored in the vector database.")
+        # Get the response without streaming
+        response = llm.invoke(messages)
+        return response.content
 
-    if st.button("Submit"):
-        if user_query:
+    except Exception as e:
+        return f"Error in get_response_from_query: {str(e)}"
+
+# Streamlit UI
+st.title("PDF QA System")
+st.write("Upload your PDFs and ask questions based on the content.")
+
+uploaded_files = st.file_uploader("Upload PDF files", accept_multiple_files=True, type="pdf")
+if uploaded_files:
+    if st.button("Process Files"):
+        with st.spinner("Processing files..."):
             try:
-                # Search for the most relevant text chunks
-                indices = search_vector_store(user_query, vector_store, embeddings, k=3)
-                context = "\n".join([text_chunks[i] for i in indices[0]])  # Retrieve the top k relevant chunks
-
-                # Generate a response using the retrieved context
-                summary = llama_response(f"{context}\n{user_query}")
-                st.write(summary)
+                raw_text = text_from_pdf(uploaded_files)
+                text_chunks = chunks_from_text(raw_text)
+                initialize_pinecone_index(text_chunks)
+                st.success("Files processed successfully.")
             except Exception as e:
-                st.write(f"Error generating response: {str(e)}")
+                st.error(f"Error processing files: {str(e)}")
 
-if __name__ == '__main__':
-    main()
+question = st.text_input("Ask a question")
+if question:
+    if st.button("Get Answer"):
+        with st.spinner("Retrieving answer..."):
+            try:
+                answer = get_response_from_query(question)
+                st.success(answer)
+            except Exception as e:
+                st.error(f"Error retrieving answer: {str(e)}")
